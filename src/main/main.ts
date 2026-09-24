@@ -9,12 +9,13 @@
  * `./src/main.js` using webpack. This gives us some performance wins.
  */
 import path from 'path';
-import { app, BrowserWindow, shell, ipcMain } from 'electron';
-import { chromium } from 'playwright';
+import { app, BrowserWindow, shell, ipcMain, dialog } from 'electron';
+import { Browser, chromium, Page } from 'playwright';
 import { autoUpdater } from 'electron-updater';
 import log from 'electron-log';
 import MenuBuilder from './menu';
 import { resolveHtmlPath } from './util';
+import ExcelJS from 'exceljs';
 
 class AppUpdater {
   constructor() {
@@ -32,23 +33,238 @@ ipcMain.on('ipc-example', async (event, arg) => {
   event.reply('ipc-example', msgTemplate('pong'));
 });
 
-ipcMain.handle('get-page-html', async (_event, url: string) => {
-  const browser = await chromium.launch({ args: ['--headless'] });
+type Store = {
+  name: string;
+  url: string;
+};
+
+type Product = {
+  name: string | null;
+  isSoldOut: boolean;
+};
+
+const getProductsFromStore = async (
+  page: Page,
+): Promise<Product[]> => {
+  const items = page.locator(
+    '[data-test-id="horizontal-item-card"]',
+  );
+
+  return items.evaluateAll((elements) => {
+    return elements.map((element) => {
+      const nameElement = element.querySelector(
+        '[data-test-id="horizontal-item-card-header"]',
+      );
+
+      const availabilityElement = element.querySelector(
+        '[data-size="small"]',
+      );
+
+      return {
+        name: nameElement?.textContent?.trim() ?? null,
+        isSoldOut:
+          availabilityElement?.textContent?.trim() === 'Elfogyott',
+      };
+    });
+  });
+};
+
+const getStoreProducts = async (
+  browser: Browser,
+  store: Store,
+): Promise<Product[]> => {
   const page = await browser.newPage();
 
-  await page.goto(url, {
+  await page.goto(store.url, {
     timeout: 100000,
     waitUntil: 'domcontentloaded',
   });
 
-  const html = await page.content();
+  const products = await getProductsFromStore(page);
 
-  const items = page.locator('[data-test-id="horizontal-item-card"]');
+  await page.close();
+
+  return products;
+};
+
+ipcMain.handle('get-page-html', async () => {
+  const urls: Store[] = [
+    {
+      name: 'Deák',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-i-deak-ter',
+    },
+    {
+      name: 'Corvin',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-corvin',
+    },
+    {
+      name: 'Westend',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-westend',
+    },
+    {
+      name: 'Keleti',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-i-keleti',
+    },
+    {
+      name: 'Thököly',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-thokoly',
+    },
+    {
+      name: 'Stadion',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-stadion',
+    },
+    {
+      name: 'Campona',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-campona',
+    },
+    {
+      name: 'Pólus',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-polus',
+    },
+    {
+      name: 'Újpest',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-ujpest-bp',
+    },
+    {
+      name: 'Remiz (Kispest)',
+      url: 'https://wolt.com/hu/hun/budapest/restaurant/pesti-pipi-19-ker-remiz',
+    },
+    {
+      name: 'Vác',
+      url: 'https://wolt.com/hu/hun/vac/restaurant/pesti-pipi-vac'
+    }
+  ];
+
+  const browser = await chromium.launch({
+    headless: true,
+  });
+
+  const result: Record<string, Record<string, boolean>> = {};
+
+  for (const store of urls) {
+    const products = await getStoreProducts(browser, store);
+
+    for (const product of products) {
+      if (!product.name) continue;
+
+      if (!result[product.name]) {
+        result[product.name] = {};
+      }
+
+      result[product.name][store.name] = !product.isSoldOut;
+    }
+  }
 
   await browser.close();
 
-  return html;
+  return result;
 });
+
+const generateExcel = async (
+  result: Record<string, Record<string, boolean>>,
+  filePath: string,
+) => {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Üzletek');
+
+  const stores = [
+    'Campona',
+    'Corvin',
+    'Deák',
+    'Keleti',
+    'Pólus',
+    'Remiz (Kispest)',
+    'Stadion',
+    'Thököly',
+    'Újpest',
+    'Westend',
+    'Vác',
+  ];
+
+  worksheet.addRow([
+    'Üzletek:',
+    ...stores,
+  ]);
+
+  for (const [productName, storeAvailability] of Object.entries(result)) {
+    const row = worksheet.addRow([
+      productName,
+      ...stores.map((store) => {
+        const available = storeAvailability[store];
+
+        if (available === undefined) {
+          return 'Nincsen';
+        }
+
+        return available ? 'Bekapcsolva' : 'Kikapcsolva';
+      }),
+    ]);
+
+    stores.forEach((store, index) => {
+      const cell = row.getCell(index + 2);
+      const available = storeAvailability[store];
+
+      if (available === true) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: {
+            argb: 'C6EFCE',
+          },
+        };
+      }
+
+      if (available === false) {
+        cell.fill = {
+          type: 'pattern',
+          pattern: 'solid',
+          fgColor: {
+            argb: 'FFC7CE',
+          },
+        };
+      }
+    });
+  }
+
+  worksheet.getColumn(1).width = 45;
+
+  stores.forEach((_, index) => {
+    worksheet.getColumn(index + 2).width = 18;
+  });
+
+  worksheet.getRow(1).font = {
+    bold: true,
+  };
+
+  await workbook.xlsx.writeFile(filePath);
+};
+
+ipcMain.handle(
+  'save-excel',
+  async (
+    _event,
+    result: Record<string, Record<string, boolean>>,
+  ) => {
+    const { canceled, filePath } = await dialog.showSaveDialog({
+      title: 'Excel mentése',
+      defaultPath: 'pipi-eredmeny.xlsx',
+      filters: [
+        {
+          name: 'Excel fájl',
+          extensions: ['xlsx'],
+        },
+      ],
+    });
+
+    if (canceled || !filePath) {
+      return false;
+    }
+
+    await generateExcel(result, filePath);
+
+    return true;
+  },
+);
 
 if (process.env.NODE_ENV === 'production') {
   const sourceMapSupport = require('source-map-support');
@@ -58,9 +274,9 @@ if (process.env.NODE_ENV === 'production') {
 const isDebug =
   process.env.NODE_ENV === 'development' || process.env.DEBUG_PROD === 'true';
 
-if (isDebug) {
-  require('electron-debug').default();
-}
+// if (isDebug) {
+//   require('electron-debug').default();
+// }
 
 const installExtensions = async () => {
   const installer = require('electron-devtools-installer');
